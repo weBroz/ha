@@ -1,147 +1,280 @@
-<!--
-Cartoon Camera + NASA Pollution Overlay (Smoke Effect)
-Single-file HTML (includes CSS + JS)
-
-What this does:
-- Opens the user's camera and paints a processed (cartoon-ish) version to a <canvas>.
-- Uses geolocation to get lat/lon and fetches pollution data from NASA POWER API (Aerosol Optical Depth).
-- Adds a smoke effect overlay on the video, where smoke density increases with pollution intensity (AOD → AQI mapping).
-
-Important deployment notes:
-- Must be served over HTTPS or localhost for camera & geolocation.
-- NASA POWER API does not require an API key.
--->
 
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Cartoon Camera + NASA Pollution Smoke</title>
+  <title>NASA Pollution Visualizer</title>
   <style>
-    body{margin:0;background:#000;display:flex;justify-content:center;align-items:center;height:100vh;color:#fff;font-family:sans-serif}
-    #outputCanvas{width:100%;height:100%;object-fit:cover}
-    #info{position:absolute;top:10px;left:10px;background:rgba(0,0,0,0.5);padding:10px;border-radius:8px;font-size:14px}
-    #smokeCanvas{position:absolute;top:0;left:0;pointer-events:none}
+    html, body {
+      margin: 0;
+      padding: 0;
+      font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      scroll-behavior: smooth;
+      background: #000;
+      color: #fff;
+    }
+
+    /* Header Section */
+    #header {
+      height: 100vh;
+      width: 100%;
+      background: url(h1.jpg) center/cover no-repeat;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      flex-direction: column;
+      text-align: center;
+    }
+
+    #header h1 {
+      font-size: 3rem;
+      margin: 0 0 20px;
+      color: #fff;
+      text-shadow: 0 2px 10px rgba(0,0,0,0.6);
+    }
+
+    #scrollBtn {
+      padding: 15px 30px;
+      font-size: 1.2rem;
+      font-weight: bold;
+      border: none;
+      border-radius: 8px;
+      background: #4CAF50;
+      color: white;
+      cursor: pointer;
+      transition: 0.3s;
+    }
+    #scrollBtn:hover {
+      background: #45a049;
+    }
+
+    /* Camera + Canvas Section */
+    #main {
+      height: 100vh;
+      width: 100%;
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    #outputCanvas, #smokeCanvas, #waterCanvas {
+      position: absolute;
+      top:0; left:0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    #info {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      background: rgba(0,0,0,0.6);
+      padding: 10px;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.4;
+      z-index: 10;
+    }
   </style>
 </head>
 <body>
-  <video id="video" playsinline autoplay muted style="display:none"></video>
-  <canvas id="outputCanvas" width="1280" height="720"></canvas>
-  <canvas id="smokeCanvas" width="1280" height="720"></canvas>
-  <div id="info">Loading...</div>
+  <!-- Header with Image -->
+  <section id="header">
+    <h1>NASA Pollution Visualizer</h1>
+    <button id="scrollBtn">View Live Effect ↓</button>
+  </section>
 
-<script>
-const video = document.getElementById('video');
-const canvas = document.getElementById('outputCanvas');
-const ctx = canvas.getContext('2d');
-const smokeCanvas = document.getElementById('smokeCanvas');
-const smokeCtx = smokeCanvas.getContext('2d');
-const info = document.getElementById('info');
+  <!-- Main Camera + Effects Section -->
+  <section id="main">
+    <video id="video" playsinline autoplay muted style="display:none"></video>
+    <canvas id="outputCanvas"></canvas>
+    <canvas id="smokeCanvas"></canvas>
+    <canvas id="waterCanvas"></canvas>
+    <div id="info">Loading...</div>
+  </section>
 
-let stream=null;
-let running=true;
-let lastAQI=0;
+  <script>
+    // Scroll button
+    document.getElementById("scrollBtn").addEventListener("click", () => {
+      document.getElementById("main").scrollIntoView({ behavior: "smooth" });
+    });
 
-// ====== Camera ======
-async function startCamera(){
-  try{
-    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1280},height:{ideal:720}}});
-    video.srcObject = stream;
-    await video.play();
-    drawLoop();
-  }catch(e){alert('Camera error: '+e.message);}
-}
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('outputCanvas');
+    const ctx = canvas.getContext('2d');
+    const smokeCanvas = document.getElementById('smokeCanvas');
+    const smokeCtx = smokeCanvas.getContext('2d');
+    const waterCanvas = document.getElementById('waterCanvas');
+    const waterCtx = waterCanvas.getContext('2d');
+    const info = document.getElementById('info');
 
-// ====== NASA Pollution Fetch ======
-async function fetchPollution(lat, lon){
-  try {
-    const today = new Date().toISOString().slice(0,10).replace(/-/g,'');
-    const url = `https://power.larc.nasa.gov/api/temporal/hourly/point?parameters=AOD&community=RE&longitude=${lon}&latitude=${lat}&format=JSON&start=${today}&end=${today}`;
-    const res = await fetch(url);
-    const data = await res.json();
+    let stream = null;
+    let running = true;
+    let lastAQI = 0;
+    let lastCHL = 0;
+    let particles = [];
 
-    if (data.properties && data.properties.parameter && data.properties.parameter.AOD) {
-      const values = Object.values(data.properties.parameter.AOD);
-      const lastVal = values[values.length - 1]; 
-      const aqi = Math.min(500, Math.round(lastVal * 500));
-      return { pollutant:'AOD', value:lastVal, aqi };
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const fmt = (n, d = 3) => (typeof n === 'number' ? n.toFixed(d) : '—');
+
+    function resizeCanvases() {
+      const w = window.innerWidth || 1280;
+      const h = window.innerHeight || 720;
+      [canvas, smokeCanvas, waterCanvas].forEach(c => {
+        c.width = w;
+        c.height = h;
+      });
     }
-  } catch (e) {
-    console.warn('NASA fetch failed', e);
-  }
-  return { pollutant:'AOD', value:null, aqi:0 };
-}
+    window.addEventListener('resize', resizeCanvases);
+    resizeCanvases();
 
-async function updateLocationAndPoll(){
-  if(!navigator.geolocation){alert('Geolocation not available');return;}
-  navigator.geolocation.getCurrentPosition(async pos=>{
-    const lat=pos.coords.latitude, lon=pos.coords.longitude;
-    const data = await fetchPollution(lat, lon);
-    lastAQI = data.aqi;
-    info.textContent = `Lat:${lat.toFixed(2)}, Lon:${lon.toFixed(2)} | AOD:${data.value} | AQI~${data.aqi}`;
-  },err=>{console.warn('geo err',err);});
-}
-
-// ====== Cartoon Effect ======
-function cartoonize(){
-  const w=canvas.width,h=canvas.height;
-  ctx.drawImage(video,0,0,w,h);
-  let img=ctx.getImageData(0,0,w,h);
-  const data=img.data;
-  for(let i=0;i<data.length;i+=4){
-    data[i]=Math.floor(data[i]/32)*32;
-    data[i+1]=Math.floor(data[i+1]/32)*32;
-    data[i+2]=Math.floor(data[i+2]/32)*32;
-  }
-  ctx.putImageData(img,0,0);
-}
-
-// ====== Smoke Effect ======
-let particles=[];
-function createParticles(amount){
-  for(let i=0;i<amount;i++){
-    particles.push({x:Math.random()*smokeCanvas.width,y:smokeCanvas.height+Math.random()*100,alpha:Math.random(),size:20+Math.random()*40,speed:0.5+Math.random()});
-  }
-}
-
-function drawSmoke(){
-  smokeCtx.clearRect(0,0,smokeCanvas.width,smokeCanvas.height);
-  for(let p of particles){
-    smokeCtx.fillStyle=`rgba(200,200,200,${p.alpha})`;
-    smokeCtx.beginPath();
-    smokeCtx.arc(p.x,p.y,p.size,0,Math.PI*2);
-    smokeCtx.fill();
-    p.y-=p.speed;
-    p.alpha-=0.002;
-    if(p.alpha<=0){
-      p.x=Math.random()*smokeCanvas.width;
-      p.y=smokeCanvas.height+50;
-      p.alpha=0.5+Math.random()*0.5;
-      p.size=20+Math.random()*40;
-      p.speed=0.5+Math.random();
+    async function startCamera() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 }},
+          audio: false
+        });
+        video.srcObject = stream;
+        await video.play();
+        drawLoop();
+      } catch (e) {
+        alert('Camera error: ' + e.message);
+      }
     }
-  }
-}
 
-// ====== Draw Loop ======
-function drawLoop(){
-  if(!running) return;
-  cartoonize();
-  // smoke intensity depends on AQI
-  let intensity = Math.floor(lastAQI/50); // more AQI = more particles
-  createParticles(intensity);
-  drawSmoke();
-  requestAnimationFrame(drawLoop);
-}
+    async function fetchEnvData(lat, lon) {
+      try {
+        const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+        const url = `https://power.larc.nasa.gov/api/temporal/daily/point?parameters=AOD,CHL&community=RE&longitude=${lon}&latitude=${lat}&format=JSON&start=${today}&end=${today}`;
+        const res = await fetch(url);
+        const data = await res.json();
 
-// ====== Init ======
-(async function init(){
-  await startCamera();
-  await updateLocationAndPoll();
-  setInterval(updateLocationAndPoll,300000); // refresh every 5 minutes
-})();
+        let aodVal = null, chlVal = null;
+        if (data?.properties?.parameter) {
+          if (data.properties.parameter.AOD) {
+            const values = Object.values(data.properties.parameter.AOD);
+            aodVal = values.length ? values[values.length - 1] : null;
+          }
+          if (data.properties.parameter.CHL) {
+            const values = Object.values(data.properties.parameter.CHL);
+            chlVal = values.length ? values[values.length - 1] : null;
+          }
+        }
 
-</script>
+        const numericAod = typeof aodVal === 'number' ? aodVal : 0;
+        const aqi = clamp(Math.round(numericAod * 500), 0, 500);
+
+        return { aodVal, chlVal, aqi };
+      } catch {
+        return { aodVal: null, chlVal: null, aqi: 0 };
+      }
+    }
+
+    async function updateLocationAndPoll() {
+      if (!navigator.geolocation) return;
+      navigator.geolocation.getCurrentPosition(async pos => {
+        const lat = pos.coords.latitude, lon = pos.coords.longitude;
+        const data = await fetchEnvData(lat, lon);
+        lastAQI = data.aqi || 0;
+        lastCHL = typeof data.chlVal === 'number' ? data.chlVal : 0;
+
+        const waterQuality =
+          lastCHL === null ? 'Unknown' :
+          lastCHL < 0.5 ? 'Clean' :
+          lastCHL < 2 ? 'Moderate' : 'Polluted';
+
+        info.innerHTML = `
+          🌍 Lat: ${lat.toFixed(4)}, Lon: ${lon.toFixed(4)}<br>
+          ☁ AOD: ${fmt(data.aodVal ?? 0)} | AQI ~ ${data.aqi}<br>
+          💧 Chlorophyll: ${fmt(data.chlVal ?? 0)} mg/m³ (${waterQuality})
+        `;
+      });
+    }
+
+    function cartoonize() {
+      const w = canvas.width, h = canvas.height;
+      try { ctx.drawImage(video, 0, 0, w, h); } catch { return; }
+      let img = ctx.getImageData(0, 0, w, h);
+      const data = img.data;
+      const quant = 24;
+      for (let i = 0; i < data.length; i += 4) {
+        data[i] = Math.floor(data[i] / quant) * quant;
+        data[i+1] = Math.floor(data[i+1] / quant) * quant;
+        data[i+2] = Math.floor(data[i+2] / quant) * quant;
+      }
+      ctx.putImageData(img, 0, 0);
+    }
+
+    function ensureParticlesTarget() {
+      const target = clamp(Math.round(lastAQI * 1.2), 0, 600);
+      while (particles.length < target) {
+        particles.push({
+          x: Math.random() * smokeCanvas.width,
+          y: smokeCanvas.height + Math.random() * 120,
+          alpha: 0.2 + Math.random() * 0.6,
+          size: 20 + Math.random() * 80,
+          speed: 0.2 + Math.random() * 1.2,
+          drift: (Math.random() - 0.5) * 0.6
+        });
+      }
+      if (particles.length > target) particles.splice(0, particles.length - target);
+    }
+
+    function drawSmoke() {
+      const w = smokeCanvas.width, h = smokeCanvas.height;
+      smokeCtx.clearRect(0, 0, w, h);
+      for (let p of particles) {
+        const grd = smokeCtx.createRadialGradient(p.x, p.y, p.size*0.1, p.x, p.y, p.size);
+        const alpha = clamp(p.alpha * (0.6 + lastAQI/1000), 0, 0.9);
+        grd.addColorStop(0, `rgba(200,200,200,${alpha})`);
+        grd.addColorStop(1, `rgba(200,200,200,0)`);
+        smokeCtx.fillStyle = grd;
+        smokeCtx.beginPath();
+        smokeCtx.arc(p.x, p.y, p.size, 0, Math.PI*2);
+        smokeCtx.fill();
+        p.y -= p.speed;
+        p.x += p.drift;
+        p.alpha -= 0.001;
+        if (p.alpha <= 0 || p.y+p.size<0) {
+          p.x = Math.random()*w; p.y = h+Math.random()*120;
+          p.alpha=0.2+Math.random()*0.6;
+        }
+      }
+    }
+
+    function drawWaterOverlay() {
+      const w = waterCanvas.width, h = waterCanvas.height;
+      waterCtx.clearRect(0,0,w,h);
+      const intensity = clamp(lastCHL/3,0,1);
+      if(intensity<=0) return;
+      waterCtx.fillStyle = `rgba(25,120,30,${0.06+intensity*0.24})`;
+      waterCtx.fillRect(0,0,w,h);
+    }
+
+    function drawLoop() {
+      if(!running) return;
+      cartoonize();
+      ensureParticlesTarget();
+      drawSmoke();
+      drawWaterOverlay();
+      requestAnimationFrame(drawLoop);
+    }
+
+    (async function init(){
+      resizeCanvases();
+      await startCamera();
+      await updateLocationAndPoll();
+      setInterval(updateLocationAndPoll, 300000);
+    })();
+
+    window.addEventListener("beforeunload", () => {
+      if(stream) stream.getTracks().forEach(t=>t.stop());
+    });
+  </script>
 </body>
 </html>
